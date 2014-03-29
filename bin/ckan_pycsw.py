@@ -2,9 +2,12 @@ import sys
 import logging
 import datetime
 import io
+##Needed for the debugging code bellow
+#import codecs
 
 import requests
 from lxml import etree
+from jinja2 import Environment, FileSystemLoader
 
 from pycsw import metadata, repository, util
 import pycsw.config
@@ -14,10 +17,24 @@ logging.basicConfig(format='%(message)s', level=logging.INFO)
 
 log = logging.getLogger(__name__)
 
+def to_date(unixtime):
+    """Convert unix time to YYYY-MM-DD"""
+    try:
+        return datetime.datetime.fromtimestamp(unixtime).strftime('%Y-%m-%d')
+    except ValueError:
+        return '-1'
+
+def keyword_list(value):
+    """Ensure keywords are treated as lists"""
+    if isinstance(value, list):  # list already
+        return value
+    else:  # csv string
+        return value.split(',')
+
 def setup_db(pycsw_config):
     """Setup database tables and indexes"""
 
-    from sqlalchemy import Column, Text
+    from sqlalchemy import Boolean, Column, Text
 
     database = pycsw_config.get('repository', 'database')
     table_name = pycsw_config.get('repository', 'table', 'records')
@@ -25,6 +42,7 @@ def setup_db(pycsw_config):
     ckan_columns = [
         Column('ckan_id', Text, index=True),
         Column('ckan_modified', Text),
+        Column('ckan_collection', Boolean),
     ]
 
     pycsw.admin.setup_db(database,
@@ -63,7 +81,7 @@ def load(pycsw_config, ckan_url):
 
     log.info('Started gathering CKAN datasets identifiers: {0}'.format(str(datetime.datetime.now())))
 
-    query = 'api/search/dataset?qjson={"fl":"id,metadata_modified,extras_harvest_object_id,extras_metadata_source", "q":"harvest_object_id:[\\"\\" TO *]", "limit":1000, "start":%s}'
+    query = 'api/search/dataset?qjson={"fl":"id,metadata_modified,extras_harvest_object_id,extras_source_datajson_identifier,extras_metadata_source,extras_collection_package_id", "q":"harvest_object_id:[\\"\\" TO *]", "limit":1000, "start":%s}'
 
     start = 0
 
@@ -85,6 +103,12 @@ def load(pycsw_config, ckan_url):
                 'harvest_object_id': result['extras']['harvest_object_id'],
                 'source': result['extras'].get('metadata_source')
             }
+            is_collection = True
+            if 'collection_package_id' in result['extras']:
+                is_collection = False
+            gathered_records[result['id']]['ckan_collection'] = is_collection
+            if 'source_datajson_identifier' in result['extras']:
+                gathered_records[result['id']]['source'] = 'datajson'
 
         start = start + 1000
         log.debug('Gathered %s' % start)
@@ -165,15 +189,52 @@ def clear(pycsw_config):
 
 
 def get_record(context, repo, ckan_url, ckan_id, ckan_info):
+
     query = ckan_url + 'harvest/object/%s'
     url = query % ckan_info['harvest_object_id']
     response = requests.get(url)
 
-    if ckan_info['source'] == 'arcgis':
+    if not response.ok:
+        log.error('Could not get Harvest object for id %s (%d: %s)',
+                  ckan_id, response.status_code, response.reason)
         return
 
+    if ckan_info['source'] in ['arcgis', 'datajson']:  # convert json to iso
+        result = response.json()
+        tmpldir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                               '..',
+                               'ckanext/spatial/templates/ckanext/spatial')
+        env = Environment(loader=FileSystemLoader(tmpldir))
+ 
+        if ckan_info['source'] == 'arcgis':
+            log.info('ArcGIS detected. Converting ArcGIS JSON to ISO XML: %s' % ckan_id)
+            env.filters['to_date'] = to_date
+            tmpl = 'arcgisjson2iso.xml'
+        else:
+            log.info('Open Data JSON detected. Converting to ISO XML: %s' % ckan_id)
+            env.filters['keyword_list'] = keyword_list
+            tmpl = 'datajson2iso.xml'
+
+        template = env.get_template(tmpl)
+        content = template.render(json=result)
+        
+        ##Some debugging code to test by writing xml to a hardcoded folder
+        #outfile = codecs.open("/root/json_xml/%s.xml" % ckan_id, "w", "utf-8")
+        #outfile.write(content)
+        #outfile.close()
+        #return
+
+    else:  # harvested ISO XML
+        content = response.content
+
+    # from here we have an ISO document no matter what
     try:
-        xml = etree.parse(io.BytesIO(response.content))
+        try:
+            #log.debug('parsing XML as is')
+            xml = etree.parse(io.BytesIO(content))
+        except:
+            #log.debug('parsing XML with .encode("utf8")')
+            xml = etree.parse(io.BytesIO(content.encode("utf8")))
     except Exception, err:
         log.error('Could not pass xml doc from %s, Error: %s' % (ckan_id, err))
         return
@@ -188,6 +249,7 @@ def get_record(context, repo, ckan_url, ckan_id, ckan_info):
         record.identifier = ckan_id
     record.ckan_id = ckan_id
     record.ckan_modified = ckan_info['metadata_modified']
+    record.ckan_collection = ckan_info['ckan_collection']
 
     return record
 
@@ -272,3 +334,4 @@ if __name__ == '__main__':
     else:
         print 'Unknown command {0}'.format(arg.command)
         sys.exit(1)
+
