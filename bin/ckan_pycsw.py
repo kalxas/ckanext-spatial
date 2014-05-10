@@ -56,7 +56,7 @@ def set_keywords(pycsw_config_file, pycsw_config, ckan_url, limit=20):
 
     log.info('Fetching tags from %s', ckan_url)
     url = ckan_url + 'api/tag_counts'
-    response = requests.get(url)
+    response = requests.get(url, verify=False)
     tags = response.json()
 
     log.info('Deriving top %d tags', limit)
@@ -90,7 +90,7 @@ def load(pycsw_config, ckan_url):
     while True:
         url = ckan_url + query % start
 
-        response = requests.get(url)
+        response = requests.get(url, verify=False)
         listing = response.json()
         if not isinstance(listing, dict):
             raise RuntimeError, 'Wrong API response: %s' % listing
@@ -192,7 +192,7 @@ def get_record(context, repo, ckan_url, ckan_id, ckan_info):
 
     query = ckan_url + 'harvest/object/%s'
     url = query % ckan_info['harvest_object_id']
-    response = requests.get(url)
+    response = requests.get(url, verify=False)
 
     if not response.ok:
         log.error('Could not get Harvest object for id %s (%d: %s)',
